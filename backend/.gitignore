@@ -1,0 +1,27 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+*.jpg
+*.mp4
+
+
+*.gif
+
+.DS_Store
+
+*.db
+
+.env
+
+*.zip
+
+# CoreML export (generated on the edge node by infra/edge/export-coreml.sh)
+*.mlpackage

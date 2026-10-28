@@ -1,0 +1,79 @@
+# Inactive reference: review runner, credentials, paths and side effects before enabling.
+name: Azure Static Web Apps CI/CD
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.sha }}
+  cancel-in-progress: false
+
+env:
+  PATH: /usr/local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin
+
+jobs:
+  build_and_deploy_job:
+    if: (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && github.ref == 'refs/heads/main'
+    runs-on: [self-hosted, macOS, submission-deploy]
+    name: Build and Deploy Job
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+          lfs: false
+      - name: Build and deploy frontend
+        env:
+          NEXT_PUBLIC_API_URL: ${{ vars.NEXT_PUBLIC_API_URL }}
+          SWA_DEPLOYMENT_TOKEN: ${{ secrets.AZURE_STATIC_WEB_APPS_API_TOKEN }}
+        run: |
+          set -euo pipefail
+          cd frontend
+          npm ci
+          npm run build
+          npx --yes @azure/static-web-apps-cli@2.0.10 deploy out \
+            --deployment-token "$SWA_DEPLOYMENT_TOKEN" \
+            --env production \
+            --no-use-keychain
+
+  smoke_test:
+    needs: build_and_deploy_job
+    runs-on: [self-hosted, macOS, submission-deploy]
+    name: Post-Deploy Smoke Test
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Wait for deployment to stabilize
+        run: sleep 45
+
+      - name: Run smoke test
+        env:
+          ADMIN_PASSWORD: ${{ secrets.ADMIN_PASSWORD }}
+        run: bash tests/smoke_test.sh "${{ vars.API_URL }}" --cleanup
+
+  deploy_edge:
+    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'
+    runs-on: [self-hosted, macOS, submission-edge]
+    name: Deploy Edge Node
+    steps:
+      - name: Update code, sync models, restart service
+        run: |
+          cd $GITHUB_WORKSPACE
+          cd backend
+          $HOME/.local/bin/uv sync
+          bash $GITHUB_WORKSPACE/infra/edge/fetch-models.sh
+          bash $GITHUB_WORKSPACE/infra/edge/export-coreml.sh || echo "coreml export failed — ANE tiling unavailable"
+          launchctl bootout gui/$(id -u)/com.cocotree.monkey-edge 2>/dev/null || true
+          sleep 4
+          for i in 1 2 3 4 5; do
+            launchctl bootstrap gui/$(id -u) $HOME/Library/LaunchAgents/com.cocotree.monkey-edge.plist && break
+            echo "bootstrap attempt $i failed, retrying"; sleep 8
+          done
+          curl -sf --retry 20 --retry-delay 5 --retry-all-errors http://localhost:8000/api/health > /dev/null
+          echo "edge service healthy"
+      - name: Health check
+        run: |
+          for i in $(seq 1 30); do
+            curl -sf http://localhost:8000/api/health && exit 0
+            sleep 3
+          done
+          echo "edge service failed to become healthy"; exit 1

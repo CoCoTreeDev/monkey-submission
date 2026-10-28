@@ -1,0 +1,113 @@
+# Inactive reference: review runner, credentials, paths and side effects before enabling.
+name: Model Evaluate (Edge Gate Scores)
+
+on:
+  workflow_dispatch:
+    inputs:
+      model_id:
+        description: Ultralytics Platform model id to evaluate
+        required: true
+
+jobs:
+  evaluate:
+    name: Ratchet scores (test + val) → cloud API
+    runs-on: [self-hosted, macOS, submission-edge]
+    timeout-minutes: 120
+    env:
+      ULTRALYTICS_API_KEY: ${{ secrets.ULTRALYTICS_API_KEY }}
+      MODEL_ID: ${{ inputs.model_id }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Prepare checkout
+        run: |
+          cd $GITHUB_WORKSPACE
+
+      - name: Download candidate weights from Ultralytics Platform
+        run: |
+          cd $GITHUB_WORKSPACE
+          $HOME/.local/bin/uv run --project backend python tests/fetch_platform.py \
+            --weights "$MODEL_ID" -o ml/models/evaluate.pt
+
+      - name: Eval-set sync — auto re-anchor baseline on test/val drift
+        run: |
+          cd $GITHUB_WORKSPACE
+          $HOME/.local/bin/uv run --project backend python tests/dataset_sync.py --auto-reanchor
+      - name: Ratchet scores — test split (fail becomes passed=false)
+        run: |
+          cd $GITHUB_WORKSPACE
+          set +e
+          $HOME/.local/bin/uv run --project backend python tests/eval_ratchet.py \
+            --model ml/models/evaluate.pt --device mps --native --gray-world --gray-world-above 1.5 --half --split test \
+            2>&1 | tee /tmp/eval_test.log
+          echo "${PIPESTATUS[0]}" > /tmp/eval_test.exit
+          exit 0
+
+      - name: Ratchet scores — val split (fail becomes passed=false)
+        run: |
+          cd $GITHUB_WORKSPACE
+          set +e
+          $HOME/.local/bin/uv run --project backend python tests/eval_ratchet.py \
+            --model ml/models/evaluate.pt --device mps --native --gray-world --gray-world-above 1.5 --half --split val \
+            2>&1 | tee /tmp/eval_val.log
+          echo "${PIPESTATUS[0]}" > /tmp/eval_val.exit
+          exit 0
+
+      - name: Report scores to the cloud API
+        run: |
+          cd $GITHUB_WORKSPACE
+          $HOME/.local/bin/uv run --project backend python - <<'PY'
+          import json, os, re, sys, urllib.request
+          from pathlib import Path
+
+          repo = Path(os.environ["GITHUB_WORKSPACE"])
+          env = (repo / "backend" / ".env").read_text()
+
+          def var(name: str) -> str:
+              m = re.search(rf"^{name}=(\S+)", env, re.M)
+              return m.group(1) if m else ""
+
+          api = var("CLOUD_API_URL").rstrip("/")
+          code = var("CLOUD_ACCESS_CODE")
+          if not api or not code:
+              sys.exit("CLOUD_API_URL / CLOUD_ACCESS_CODE missing in backend/.env")
+
+          def post(path: str, body: dict, token: str | None = None) -> dict:
+              req = urllib.request.Request(
+                  api + path,
+                  data=json.dumps(body).encode(),
+                  headers={
+                      "Content-Type": "application/json",
+                      **({"Authorization": f"Bearer {token}"} if token else {}),
+                  },
+              )
+              with urllib.request.urlopen(req, timeout=30) as r:
+                  return json.loads(r.read())
+
+          token = post("/api/auth/login", {"code": code})["token"]
+          model_id = os.environ["MODEL_ID"]
+          reported = 0
+          for split in ("test", "val"):
+              log = Path(f"/tmp/eval_{split}.log").read_text()
+              exit_code = Path(f"/tmp/eval_{split}.exit").read_text().strip()
+              m = re.search(r"precision ([\d.]+) \| recall ([\d.]+) \| F1 ([\d.]+)", log)
+              if not m:
+                  print(f"{split}: no metrics line in eval output — not reporting")
+                  continue
+              b = re.search(r"baseline F1 ([\d.]+)", log)
+              body = {
+                  "model_id": model_id,
+                  "split": split,
+                  "precision": float(m.group(1)),
+                  "recall": float(m.group(2)),
+                  "f1": float(m.group(3)),
+                  "passed": exit_code == "0",
+                  "baseline_f1": float(b.group(1)) if b else 0.0,
+              }
+              print(split, "→", body)
+              post("/api/admin/training/eval-results", body, token)
+              reported += 1
+          if not reported:
+              sys.exit("no split produced metrics — evaluation failed outright")
+          print(f"reported {reported} split score(s)")
+          PY

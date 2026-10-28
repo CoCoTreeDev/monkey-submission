@@ -1,0 +1,80 @@
+# ByteTrack settings for the monkey cameras. Copy of ultralytics' stock
+# bytetrack.yaml with ONE value changed: track_buffer.
+#
+# Why (measured 2026-08-19): ultralytics builds the tracker with a hardcoded
+# frame_rate=30 (trackers/track.py), so
+#
+#     max_time_lost = int(frame_rate / 30.0 * track_buffer) = track_buffer
+#
+# in PROCESSED FRAMES. The stock 30 assumes 30 FPS video, where it buys one
+# second of occlusion tolerance. Production runs 6.5-7.0 FPS per camera
+# (deployment measurements), so stock 30 buys only ~4.4 s — less than half of our own
+# TRACK_LOST_SECONDS=9. The layer underneath gave up first: a macaque that
+# dropped out for 6-18 s came back under a NEW id, and every new id is a new
+# detection row and a new trail clip. Four such pairs from the 2026-08-13
+# harvest were inspected frame by frame and were the same individual in the
+# same spot, down to the reflector behind it.
+#
+# Swept on the harvest with tests/bench_track_fragmentation.py (107 scenes):
+#
+# (seconds at 6.5 FPS, the LOW end of the measured range — the low end is what
+# decides safety, because fewer frames per second makes a frame count last
+# longer in wall clock.)
+#
+#   track_buffer   ~seconds   median frag   scenes >1.5   teleports
+#             30       4.6s          1.33            40           4
+#             40       6.2s          1.25            31           7
+#             46       7.1s          1.25            28           7
+#             55       8.5s          1.25            28           7
+#             60       9.2s          1.25            28           7
+#            135      20.8s          1.25            24           7
+#
+# A *teleport* — an id jumping to a box that does not overlap where it last was
+# — is the shape a wrong re-association takes, and is the cost the continuation design was
+# right to worry about. It stays in single digits across the whole harvest, so
+# the trade is cheap.
+#
+# ── Why 46 and not 135, which scores better ──────────────────────────────────
+#
+# HARD CONSTRAINT: this must stay BELOW config.TRACK_LOST_SECONDS (9.0 s), the
+# timeout after which we finalise a track and WRITE ITS ROW. Whichever layer
+# gives up first decides who fragments:
+#
+#   buffer < TRACK_LOST_SECONDS  →  ByteTrack retires the id, our still-live
+#                                   _TrackState absorbs the continuation, and
+#                                   _adopt_continuation can stitch the rest.
+#   buffer > TRACK_LOST_SECONDS  →  WE finalise and write a row at 9 s while
+#                                   ByteTrack is still holding the id. When the
+#                                   animal returns at, say, 12 s it comes back
+#                                   under the SAME id, _update_track finds no
+#                                   active state for it and builds a fresh one,
+#                                   and we file a SECOND row — with a duplicate
+#                                   track_id, and past the reach of the
+#                                   continuation merge because the first row is
+#                                   already in the database.
+#
+# So 135 (20.8 s) would relocate the bug rather than fix it unless
+# TRACK_LOST_SECONDS rose past it — and that timeout is also the delay before a
+# detection reaches the dashboard and Discord, so 9 s → 21 s would make every
+# alert 2.3x later. For four fewer badly-fragmented scenes out of 107, it is
+# not worth it.
+#
+# 46 is the smallest value that gets the FULL benefit available under the
+# constraint: it takes the median down (1.33 → 1.25) and reaches 28 bad scenes,
+# which is exactly what 55 and 60 score. Everything above it buys nothing and
+# only eats margin — 60 is already 9.2 s at 6.5 FPS, over the line.
+#
+# CAUTION: this is a FRAME count, so its value in seconds moves with
+# throughput. If per-camera FPS changes materially (more cameras, a different
+# imgsz, new hardware) this can cross TRACK_LOST_SECONDS without anyone editing
+# it. tests/test_detection_events.py asserts the invariant; re-run the bench
+# rather than assuming 7.1 s still holds. The same trap is documented on
+# TRACK_LOST_SECONDS in config.py.
+
+tracker_type: bytetrack # (str) Tracker backend: botsort|bytetrack; choose bytetrack for the classic baseline
+track_high_thresh: 0.25 # (float) First-stage match threshold; raise for cleaner tracks, lower to keep more
+track_low_thresh: 0.1 # (float) Second-stage threshold for low-score matches; balances recovery vs drift
+new_track_thresh: 0.25 # (float) Start a new track if no match ≥ this; higher reduces false tracks
+track_buffer: 46 # (int) Frames to keep lost tracks alive — 7.1 s at the 6.5 FPS low end, and it MUST stay under TRACK_LOST_SECONDS. See header.
+match_thresh: 0.8 # (float) Association similarity threshold (IoU/cost); tune with detector quality
+fuse_score: True # (bool) Fuse detection score with motion/IoU for matching; stabilizes weak detections

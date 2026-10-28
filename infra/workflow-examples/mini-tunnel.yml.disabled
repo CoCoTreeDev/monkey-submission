@@ -1,0 +1,97 @@
+# Inactive reference: review runner, credentials, paths and side effects before enabling.
+name: Mini Tunnel
+
+on:
+  workflow_dispatch:
+    inputs:
+      action:
+        description: install | status | uninstall
+        default: status
+        required: false
+
+jobs:
+  tunnel:
+    name: Cloudflare Tunnel on the edge node
+    runs-on: [self-hosted, macOS, submission-edge]
+    timeout-minutes: 10
+    env:
+      LABEL: com.cocotree.cloudflared-mini
+      TOKEN: ${{ secrets.CF_TUNNEL_TOKEN }}
+
+    steps:
+      - name: Locate or fetch cloudflared
+        id: bin
+        run: |
+          set -e
+          export PATH="$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"
+          if ! command -v cloudflared >/dev/null 2>&1; then
+            echo "cloudflared absent — fetching the release binary"
+            mkdir -p "$HOME/.local/bin"
+            ARCH=arm64; [ "$(uname -m)" = "x86_64" ] && ARCH=amd64
+            URL="https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-darwin-$ARCH.tgz"
+            curl -fsSL --retry 3 "$URL" -o /tmp/cloudflared.tgz
+            tar -xzf /tmp/cloudflared.tgz -C "$HOME/.local/bin" cloudflared
+            chmod +x "$HOME/.local/bin/cloudflared"
+            rm -f /tmp/cloudflared.tgz
+          fi
+          BIN="$(command -v cloudflared)"
+          echo "bin=$BIN" >> "$GITHUB_OUTPUT"
+          echo "found: $BIN  ($("$BIN" --version 2>&1 | head -1))"
+
+      - name: Report what already runs here
+        run: |
+          echo "== cloudflared processes =="
+          pgrep -fl cloudflared || echo "(none)"
+          echo "== launch agents/daemons mentioning cloudflared =="
+          ls -1 ~/Library/LaunchAgents/ 2>/dev/null | grep -i cloudflare || echo "(no user agents)"
+          ls -1 /Library/LaunchDaemons/ 2>/dev/null | grep -i cloudflare || echo "(no system daemons)"
+          echo "== is sshd listening? =="
+          if nc -z localhost 22; then echo "port 22 open"; else echo "::warning::port 22 CLOSED — enable Remote Login or the tunnel connects to nothing"; fi
+
+      - name: Install
+        if: inputs.action == 'install'
+        run: |
+          set -e
+          test -n "$TOKEN" || { echo "::error::secret CF_TUNNEL_TOKEN is not set"; exit 1; }
+          BIN='${{ steps.bin.outputs.bin }}'
+          mkdir -p ~/Library/LaunchAgents ~/logs
+          PLIST=~/Library/LaunchAgents/$LABEL.plist
+          cat > "$PLIST" <<PL
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0"><dict>
+            <key>Label</key><string>$LABEL</string>
+            <key>ProgramArguments</key><array>
+              <string>$BIN</string><string>tunnel</string><string>--no-autoupdate</string>
+              <string>run</string><string>--token</string><string>$TOKEN</string>
+            </array>
+            <key>RunAtLoad</key><true/>
+            <key>KeepAlive</key><true/>
+            <key>StandardOutPath</key><string>$HOME/logs/cloudflared-mini.log</string>
+            <key>StandardErrorPath</key><string>$HOME/logs/cloudflared-mini.log</string>
+          </dict></plist>
+          PL
+          chmod 600 "$PLIST"
+          launchctl bootout gui/$(id -u)/$LABEL 2>/dev/null || true
+          launchctl bootstrap gui/$(id -u) "$PLIST"
+          launchctl enable gui/$(id -u)/$LABEL
+          echo "bootstrapped; waiting for connections"
+          for i in $(seq 1 20); do
+            sleep 3
+            grep -q "Registered tunnel connection" ~/logs/cloudflared-mini.log 2>/dev/null && break
+          done
+
+      - name: Uninstall
+        if: inputs.action == 'uninstall'
+        run: |
+          launchctl bootout gui/$(id -u)/$LABEL 2>/dev/null || true
+          rm -f ~/Library/LaunchAgents/$LABEL.plist
+          echo "removed"
+
+      - name: Status
+        if: always()
+        run: |
+          echo "== agent =="
+          launchctl print gui/$(id -u)/$LABEL 2>/dev/null | grep -E "state|pid|last exit" || echo "(not loaded)"
+          echo "== last log lines (token redacted) =="
+          sed -E 's/[A-Za-z0-9_-]{40,}/<redacted>/g' ~/logs/cloudflared-mini.log 2>/dev/null | tail -20 || echo "(no log)"

@@ -1,0 +1,38 @@
+# Inactive reference: review runner, credentials, paths and side effects before enabling.
+name: Edge Benchmark
+
+on:
+  workflow_dispatch:
+    inputs:
+      script:
+        description: Benchmark script to run (repo-relative path)
+        default: tests/bench_edge_delivery.py
+        required: false
+      args:
+        description: Extra arguments passed to the script
+        default: ""
+        required: false
+
+jobs:
+  bench:
+    name: Frame Delivery + Batch Benchmark
+    runs-on: [self-hosted, macOS, submission-edge]
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Edge log health (reconnects, last 2h)
+        run: |
+          LOG=$HOME/logs/monkey-edge.log
+          echo "== reconnect/lost-frame lines in current log =="
+          grep -cE "lost frame|reconnect" "$LOG" || true
+          grep -E "lost frame|reconnect" "$LOG" | tail -10 || true
+          echo "== .env keys on this node (values redacted) =="
+          sed -E 's/=.*//' $GITHUB_WORKSPACE/backend/.env
+          echo "== non-secret inference settings =="
+          grep -E "^(FRAME_SKIP|INFERENCE_|MODEL_PATH|STREAM_FPS)" $GITHUB_WORKSPACE/backend/.env || echo "(none set — using config.py defaults)"
+
+      - name: Run benchmark
+        run: |
+          cd $GITHUB_WORKSPACE/backend
+          $HOME/.local/bin/uv run python "$GITHUB_WORKSPACE/${{ inputs.script || 'tests/bench_edge_delivery.py' }}" ${{ inputs.args }} 2>&1 | grep -viE "Warning|h264|cbp too|^\[" || true

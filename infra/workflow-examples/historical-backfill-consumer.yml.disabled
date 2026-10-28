@@ -1,0 +1,101 @@
+# Inactive reference: review runner, credentials, paths and side effects before enabling.
+name: Historical Backfill Consumer
+
+on:
+  workflow_dispatch:
+    inputs:
+      reference_path:
+        description: "Reference manifest path on the configured runner"
+        required: true
+        default: "/path/to/backfill/reference_manifest.json"
+      queue_path:
+        description: "Queue JSON path on the configured runner"
+        required: true
+        default: "/path/to/backfill/active/queue.json"
+      archive_root:
+        description: "Raw archive directory on the configured runner"
+        required: true
+        default: "/path/to/backfill/zips"
+      output_dir:
+        description: "Isolated review output directory on the configured runner"
+        required: true
+        default: "/path/to/backfill/active"
+      model:
+        description: "Model path on the configured runner"
+        required: true
+        default: "/path/to/monkey-monitoring/backend/best.pt"
+      imgsz:
+        description: "Inference image size"
+        required: true
+        default: "2048"
+      conf:
+        description: "Candidate confidence threshold"
+        required: true
+        default: "0.35"
+      skip_failed:
+        description: "Skip damaged clips and continue"
+        type: boolean
+        required: true
+        default: true
+
+concurrency:
+  group: monkey-historical-backfill
+  cancel-in-progress: false
+
+jobs:
+  consume:
+    name: MPS consumer
+    runs-on: [self-hosted, macOS, submission-edge]
+    timeout-minutes: 1440
+    env:
+      REFERENCE_PATH: ${{ inputs.reference_path }}
+      QUEUE_PATH: ${{ inputs.queue_path }}
+      ARCHIVE_ROOT: ${{ inputs.archive_root }}
+      OUTPUT_DIR: ${{ inputs.output_dir }}
+      MODEL_PATH: ${{ inputs.model }}
+      INFERENCE_IMGSZ: ${{ inputs.imgsz }}
+      INFERENCE_CONF: ${{ inputs.conf }}
+      SKIP_FAILED: ${{ inputs.skip_failed }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Prepare checkout
+        run: |
+          set -euo pipefail
+          cd "$GITHUB_WORKSPACE"
+          "$HOME/.local/bin/uv" sync --project backend
+
+      - name: Consume queued clips on MPS
+        run: |
+          set -euo pipefail
+          export PATH="/opt/homebrew/bin:/usr/local/bin:$PATH"
+          cd "$GITHUB_WORKSPACE"
+          if [[ ! -f "$QUEUE_PATH" ]]; then
+            "$HOME/.local/bin/uv" run --project backend python \
+              tests/backfill_consumer.py init \
+              --reference "$REFERENCE_PATH" --queue "$QUEUE_PATH"
+          fi
+          args=(
+            run
+            --queue "$QUEUE_PATH"
+            --archive-root "$ARCHIVE_ROOT"
+            --trail-root "$(dirname "$ARCHIVE_ROOT")"
+            --model "$MODEL_PATH"
+            --tracker "$GITHUB_WORKSPACE/backend/trackers/bytetrack-monkey.yaml"
+            --output "$OUTPUT_DIR"
+            --imgsz "$INFERENCE_IMGSZ"
+            --conf "$INFERENCE_CONF"
+            --upload
+          )
+          if [[ "$SKIP_FAILED" == "true" ]]; then
+            args+=(--skip-failed)
+          fi
+          "$HOME/.local/bin/uv" run --project backend python \
+            tests/backfill_consumer.py "${args[@]}"
+
+      - name: Print final queue status
+        if: always()
+        run: |
+          cd "$GITHUB_WORKSPACE"
+          "$HOME/.local/bin/uv" run --project backend python \
+            tests/backfill_consumer.py status --queue "$QUEUE_PATH"

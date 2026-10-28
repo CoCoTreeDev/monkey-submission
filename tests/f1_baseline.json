@@ -1,0 +1,14 @@
+{
+  "f1": 0.8354,
+  "precision": 0.9035,
+  "recall": 0.7768,
+  "mean_iou": 0.8125,
+  "dataset": "monkey-cocotree-v2.ndjson",
+  "test_images": 342,
+  "benchmark": null,
+  "imgsz": "native>=1600+grayworld>1.5",
+  "conf": 0.5,
+  "half": true,
+  "split": "test",
+  "updated_at": "2026-09-29T18:06:52+00:00"
+}

@@ -1,0 +1,139 @@
+# Inactive reference: review runner, credentials, paths and side effects before enabling.
+name: Model Promote (Ratchet Gate)
+
+on:
+  workflow_dispatch:
+    inputs:
+      model_id:
+        description: Ultralytics Platform model id to promote
+        required: true
+      force:
+        description: "強制上板：棘輪未通過也部署（baseline 不會更動）"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+  actions: write
+
+jobs:
+  promote:
+    name: Ratchet double-gate + promote
+    runs-on: [self-hosted, macOS, submission-edge]
+    timeout-minutes: 120
+    env:
+      ULTRALYTICS_API_KEY: ${{ secrets.ULTRALYTICS_API_KEY }}
+      MODEL_ID: ${{ inputs.model_id }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Prepare checkout
+        run: |
+          cd $GITHUB_WORKSPACE
+
+      - name: Download candidate weights from Ultralytics Platform
+        run: |
+          cd $GITHUB_WORKSPACE
+          $HOME/.local/bin/uv run --project backend python tests/fetch_platform.py \
+            --weights "$MODEL_ID" -o ml/models/promote.pt
+
+      - name: Eval-set sync — auto re-anchor baseline on test/val drift
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          cd $GITHUB_WORKSPACE
+          $HOME/.local/bin/uv run --project backend python tests/dataset_sync.py --auto-reanchor
+
+      - name: Ratchet gate — test split
+        id: gate_test
+        continue-on-error: true
+        run: |
+          cd $GITHUB_WORKSPACE
+          set -o pipefail
+          $HOME/.local/bin/uv run --project backend python tests/eval_ratchet.py \
+            --model ml/models/promote.pt --device mps --native --gray-world --gray-world-above 1.5 --half --split test \
+            2>&1 | tee /tmp/gate-test.log
+
+      - name: Ratchet gate — val split
+        id: gate_val
+        continue-on-error: true
+        run: |
+          cd $GITHUB_WORKSPACE
+          set -o pipefail
+          $HOME/.local/bin/uv run --project backend python tests/eval_ratchet.py \
+            --model ml/models/promote.pt --device mps --native --gray-world --gray-world-above 1.5 --half --split val \
+            2>&1 | tee /tmp/gate-val.log
+
+      - name: Gate verdict
+        id: verdict
+        env:
+          FORCE: ${{ inputs.force }}
+          TEST_OUTCOME: ${{ steps.gate_test.outcome }}
+          VAL_OUTCOME: ${{ steps.gate_val.outcome }}
+        run: |
+          set -u
+          failed=""
+          broken=""
+          for split in test val; do
+            case "$split" in
+              test) outcome="$TEST_OUTCOME" ;;
+              val)  outcome="$VAL_OUTCOME" ;;
+            esac
+            [ "$outcome" = "success" ] && continue
+            if grep -q "RATCHET FAIL" "/tmp/gate-$split.log" 2>/dev/null; then
+              failed="$failed $split"
+            else
+              broken="$broken $split"
+            fi
+          done
+          failed="${failed# }"; broken="${broken# }"
+          echo "failed=$failed" >> "$GITHUB_OUTPUT"
+
+          if [ -n "$broken" ]; then
+            echo "::error::$broken 的棘輪評測沒有跑完（不是分數不夠，是評測本身失敗）。"
+            echo "::error::強制上板不會覆蓋這種錯誤 — 先看上面那步的輸出。"
+            exit 1
+          fi
+
+          if [ -z "$failed" ]; then
+            echo "雙 split 都通過棘輪。"
+            exit 0
+          fi
+
+          if [ "$FORCE" != "true" ]; then
+            echo "::error::RATCHET FAIL on $failed — 不上板。要無視棘輪請用「強制上板」。"
+            exit 1
+          fi
+
+          echo "::warning::強制上板：$failed 未通過棘輪，仍依指示部署。"
+          echo "::warning::baseline 不會更動 — 之後評測會持續對線上模型報 FAIL，這是刻意的。"
+          echo "::warning::請到 ml/PROMOTIONS.md 補一列，寫清楚放棄了什麼。"
+
+      - name: Promote — swap best.pt, refresh baseline, push
+        env:
+          MODEL_ID: ${{ inputs.model_id }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          FAILED: ${{ steps.verdict.outputs.failed }}
+        run: |
+          cd $GITHUB_WORKSPACE
+          cp ml/models/promote.pt backend/best.pt
+          if [ -n "$FAILED" ]; then
+            echo "強制上板：不更新 baseline，維持原本的地板"
+            git add backend/best.pt
+            MSG="chore: force-promote model $MODEL_ID over a ratchet fail on $FAILED; the floor is left alone"
+          else
+            $HOME/.local/bin/uv run --project backend python tests/eval_ratchet.py \
+              --device mps --native --gray-world --gray-world-above 1.5 --half --update-baseline
+            git add backend/best.pt tests/f1_baseline.json
+            MSG="chore: promote model $MODEL_ID (ratchet pass)"
+          fi
+          if git diff --cached --quiet; then
+            echo "candidate identical to deployed best.pt — nothing to commit"
+          else
+            git commit -m "$MSG"
+            git push "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" HEAD:main
+            curl -sf -X POST -H "Authorization: Bearer ${GH_TOKEN}" \
+              -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/workflows/azure-static-web-apps.yml/dispatches" \
+              -d '{"ref":"main"}'
+          fi

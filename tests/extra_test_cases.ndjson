@@ -1,0 +1,1 @@
+{"type": "dataset", "name": "monkey cocotree — repo-local assertions", "note": "This snapshot contains no active repo-local image records or must_sight assertions. The evaluation gate uses aggregate metrics and dataset basis checks; it does not currently assert that every individual detection capability is retained."}
